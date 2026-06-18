@@ -392,6 +392,12 @@ textarea:focus {
   flex-wrap: wrap;
 }
 
+.toolbar-summary {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
 .search-field {
   min-width: 240px;
   display: flex;
@@ -429,6 +435,16 @@ td {
   text-align: left;
   padding: 12px;
   vertical-align: top;
+}
+
+.checkbox-cell {
+  width: 38px;
+  text-align: center;
+}
+
+.checkbox-cell input {
+  width: 16px;
+  height: 16px;
 }
 
 th {

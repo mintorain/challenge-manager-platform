@@ -781,6 +781,18 @@ function App() {
     showToast(status === 'approved' ? '인증을 승인했습니다.' : '인증을 반려했습니다.')
   })
 
+  const bulkApproveSubmissions = (submissionIds) => withRemote(async () => {
+    if (!submissionIds.length) return
+    await Promise.all(submissionIds.map((submissionId) => apiRequest(`/api/admin/submissions/${submissionId}/review`, {
+      method: 'PATCH',
+      body: { status: 'approved', rejectReason: '', rejectDetail: '' },
+      token: session.token,
+    })))
+    const payload = await apiRequest('/api/bootstrap')
+    applyRemoteStore(payload)
+    showToast(`${submissionIds.length}건 인증을 일괄 승인했습니다.`)
+  })
+
   const recalculate = (challengeId) => withRemote(async () => {
     const payload = await apiRequest(`/api/admin/challenges/${challengeId}/recalculate-results`, {
       method: 'POST',
@@ -851,6 +863,7 @@ function App() {
           updateParticipant={updateParticipant}
           updatePayout={updatePayout}
           reviewSubmission={reviewSubmission}
+          bulkApproveSubmissions={bulkApproveSubmissions}
           recalculate={recalculate}
           downloadCsv={downloadCsv}
         />
@@ -1223,14 +1236,37 @@ function ChallengeForm({ store, selectedChallengeId, createChallenge, updateChal
 
 function AdminParticipants({ store, selectedChallengeId, updateParticipant, resultMap }) {
   const challenge = store.challenges.find((item) => item.id === selectedChallengeId) || store.challenges[0]
+  const [query, setQuery] = useState('')
+  const [paymentFilter, setPaymentFilter] = useState('all')
+  const [resultFilter, setResultFilter] = useState('all')
   const participants = store.participants.filter((item) => item.challengeId === challenge?.id)
+  const filteredParticipants = participants.filter((participant) => {
+    const user = store.users.find((item) => item.id === participant.userId)
+    const result = resultMap[participant.id] || participant
+    const queryOk = !query || [user?.name, user?.email, user?.phone].some((value) => String(value || '').toLowerCase().includes(query.toLowerCase()))
+    const paymentOk = paymentFilter === 'all' || participant.paymentStatus === paymentFilter
+    const resultOk = resultFilter === 'all' || (result.successStatus || participant.successStatus) === resultFilter
+    return queryOk && paymentOk && resultOk
+  })
   return (
     <Panel title={`${challenge?.title || ''} 참가자`}>
+      <div className="toolbar">
+        <div className="search-field"><Search size={16} /><input placeholder="이름, 이메일, 휴대폰 검색" value={query} onChange={(event) => setQuery(event.target.value)} /></div>
+        <select value={paymentFilter} onChange={(event) => setPaymentFilter(event.target.value)}>
+          <option value="all">전체 결제 상태</option>
+          {['pending', 'paid', 'refunded', 'canceled'].map((status) => <option key={status} value={status}>{statusLabels[status]}</option>)}
+        </select>
+        <select value={resultFilter} onChange={(event) => setResultFilter(event.target.value)}>
+          <option value="all">전체 결과 상태</option>
+          {['in_progress', 'success', 'failed'].map((status) => <option key={status} value={status}>{statusLabels[status]}</option>)}
+        </select>
+        <span className="toolbar-summary">표시 {filteredParticipants.length} / 전체 {participants.length}</span>
+      </div>
       <div className="table-wrap">
         <table>
           <thead><tr><th>참가자</th><th>신청</th><th>결제</th><th>참가</th><th>승인</th><th>결과</th><th>액션</th></tr></thead>
           <tbody>
-            {participants.map((participant) => {
+            {filteredParticipants.map((participant) => {
               const user = store.users.find((item) => item.id === participant.userId)
               const result = resultMap[participant.id] || participant
               return (
@@ -1253,37 +1289,67 @@ function AdminParticipants({ store, selectedChallengeId, updateParticipant, resu
         </table>
       </div>
       {!participants.length && <Empty text="아직 참가 신청자가 없습니다." />}
+      {!!participants.length && !filteredParticipants.length && <Empty text="조건에 맞는 참가자가 없습니다." />}
     </Panel>
   )
 }
 
-function AdminSubmissions({ store, reviewSubmission }) {
+function AdminSubmissions({ store, reviewSubmission, bulkApproveSubmissions }) {
   const [filter, setFilter] = useState('pending')
+  const [challengeFilter, setChallengeFilter] = useState('all')
+  const [platformFilter, setPlatformFilter] = useState('all')
+  const [query, setQuery] = useState('')
+  const [selectedIds, setSelectedIds] = useState([])
   const [rejecting, setRejecting] = useState(null)
-  const submissions = store.submissions.filter((item) => filter === 'all' || item.status === filter)
+  const submissions = store.submissions.filter((submission) => {
+    const challenge = store.challenges.find((item) => item.id === submission.challengeId)
+    const user = store.users.find((item) => item.id === submission.userId)
+    const statusOk = filter === 'all' || submission.status === filter
+    const challengeOk = challengeFilter === 'all' || submission.challengeId === challengeFilter
+    const platformOk = platformFilter === 'all' || (challenge?.platformType || 'blog') === platformFilter
+    const queryOk = !query || [challenge?.title, user?.name, user?.email, submission.linkUrl, submission.description]
+      .some((value) => String(value || '').toLowerCase().includes(query.toLowerCase()))
+    return statusOk && challengeOk && platformOk && queryOk
+  })
+  const pendingVisibleIds = submissions.filter((item) => item.status === 'pending').map((item) => item.id)
+  const allPendingVisibleSelected = pendingVisibleIds.length > 0 && pendingVisibleIds.every((id) => selectedIds.includes(id))
   return (
     <section className="stack">
       <div className="toolbar">
+        <div className="search-field"><Search size={16} /><input placeholder="챌린지, 참가자, 링크 검색" value={query} onChange={(e) => setQuery(e.target.value)} /></div>
         <select value={filter} onChange={(e) => setFilter(e.target.value)}>
           <option value="pending">검토 중</option>
           <option value="approved">승인</option>
           <option value="rejected">반려</option>
           <option value="all">전체</option>
         </select>
+        <select value={challengeFilter} onChange={(e) => setChallengeFilter(e.target.value)}>
+          <option value="all">전체 챌린지</option>
+          {store.challenges.map((challenge) => <option key={challenge.id} value={challenge.id}>{challenge.title}</option>)}
+        </select>
+        <select value={platformFilter} onChange={(e) => setPlatformFilter(e.target.value)}>
+          <option value="all">전체 플랫폼</option>
+          {Object.entries(platformTypes).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+        </select>
+        <button disabled={!selectedIds.length} onClick={() => bulkApproveSubmissions(selectedIds)}><Check size={16} /> 선택 승인</button>
+        <span className="toolbar-summary">선택 {selectedIds.length}건</span>
       </div>
       <div className="table-wrap">
         <table>
-          <thead><tr><th>챌린지</th><th>참가자</th><th>회차</th><th>인증</th><th>상태</th><th>액션</th></tr></thead>
+          <thead><tr><th className="checkbox-cell"><input type="checkbox" disabled={!pendingVisibleIds.length} checked={allPendingVisibleSelected} onChange={(event) => setSelectedIds(event.target.checked ? pendingVisibleIds : [])} /></th><th>챌린지</th><th>참가자</th><th>회차</th><th>인증</th><th>상태</th><th>액션</th></tr></thead>
           <tbody>
             {submissions.map((submission) => {
               const challenge = store.challenges.find((item) => item.id === submission.challengeId)
               const user = store.users.find((item) => item.id === submission.userId)
+              const isSelectable = submission.status === 'pending'
               return (
                 <tr key={submission.id}>
+                  <td className="checkbox-cell"><input type="checkbox" disabled={!isSelectable} checked={selectedIds.includes(submission.id)} onChange={(event) => setSelectedIds((current) => event.target.checked ? [...current, submission.id] : current.filter((id) => id !== submission.id))} /></td>
                   <td>{challenge?.title}</td>
-                  <td>{user?.name}</td>
+                  <td><strong>{user?.name}</strong><span className="subtext">{user?.email}</span></td>
                   <td>{submission.missionRound}회차</td>
                   <td>
+                    <PlatformBadge type={challenge?.platformType} />
                     <a href={submission.linkUrl} target="_blank" rel="noreferrer"><LinkIcon size={14} /> 링크 열기</a>
                     <span className="subtext">{submission.description}</span>
                     {submission.imageData && <img className="proof-thumb" src={submission.imageData} alt={submission.imageName || '인증 이미지'} />}
