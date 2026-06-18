@@ -1,0 +1,20 @@
+.playwright-mcp/
+
+# Workspace artifacts
+*.log
+
+# App dependencies and builds
+challenge-manager/node_modules/
+challenge-manager/dist/
+challenge-manager/dist-ssr/
+
+# Local database
+challenge-manager/data/*.sqlite
+challenge-manager/data/*.sqlite-*
+
+# Editor files
+.DS_Store
+.idea/
+.vscode/
+*.suo
+*.swp
