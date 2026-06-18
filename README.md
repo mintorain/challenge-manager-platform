@@ -94,6 +94,12 @@ npm run dev
 - 관리자: `admin@challenge.local / admin1234`
 - 참가자: `user@challenge.local / user1234`
 
+## Live Demo
+
+- GitHub Pages: `https://mintorain.github.io/challenge-manager-platform/`
+
+GitHub Pages 배포본은 Node/Express API 없이 동작하는 정적 demo 모드입니다. 브라우저 `localStorage`에 데이터를 저장하며, 관리자/참가자 흐름을 직접 체험할 수 있습니다.
+
 ## Application Notes
 
 - SQLite 파일은 `challenge-manager/data/challenge-manager.sqlite`에 저장됩니다.

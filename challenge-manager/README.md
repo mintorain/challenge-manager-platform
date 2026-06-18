@@ -29,6 +29,12 @@ API 주소:
 http://127.0.0.1:4173
 ```
 
+정적 demo 배포:
+
+```text
+https://mintorain.github.io/challenge-manager-platform/
+```
+
 ## 테스트 계정
 
 관리자:
@@ -82,6 +88,8 @@ user@challenge.local / user1234
 현재 데이터는 `data/challenge-manager.sqlite`에 저장됩니다. DB 파일을 삭제하면 API 서버 시작 시 초기 샘플 데이터가 다시 생성됩니다.
 
 사진 인증은 현재 SQLite에 base64 데이터로 저장되므로 700KB 이하 이미지로 제한됩니다. 실제 서비스에서는 S3, Supabase Storage 같은 별도 파일 저장소로 분리하는 것이 좋습니다.
+
+GitHub Pages 배포본은 Express API 없이 동작하는 브라우저 demo 모드입니다. 이 경우 데이터는 브라우저 `localStorage`에 저장되며, 관리자/참가자 흐름을 체험할 수 있습니다.
 
 ## 인증 제출 정책
 

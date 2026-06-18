@@ -26,6 +26,8 @@ import {
 import './App.css'
 
 const SESSION_KEY = 'challenge-manager-session-v1'
+const DEMO_MODE = import.meta.env.VITE_DEMO_MODE === 'true'
+const DEMO_STORE_KEY = 'challenge-manager-demo-store-v1'
 
 const today = new Date()
 const addDays = (days) => {
@@ -131,6 +133,9 @@ const challengeTemplates = {
 }
 
 const rejectReasons = ['링크 접속 불가', '기간 외 콘텐츠', '필수 조건 미충족', '중복 제출', '부적절한 콘텐츠', '기타']
+
+const clone = (value) => JSON.parse(JSON.stringify(value))
+const uid = (prefix) => `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`
 
 const seedData = () => ({
   version: 3,
@@ -246,7 +251,355 @@ const seedData = () => ({
   auditLogs: [],
 })
 
+function sanitizeStore(store) {
+  return {
+    ...clone(store),
+    users: store.users.map((user) => {
+      const nextUser = { ...user }
+      delete nextUser.password
+      return nextUser
+    }),
+  }
+}
+
+function readDemoStore() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(DEMO_STORE_KEY) || 'null')
+    if (stored?.users && stored?.challenges) return stored
+  } catch {
+    // Ignore malformed local state and reseed below.
+  }
+  const seeded = seedData()
+  localStorage.setItem(DEMO_STORE_KEY, JSON.stringify(seeded))
+  return seeded
+}
+
+function writeDemoStore(store) {
+  localStorage.setItem(DEMO_STORE_KEY, JSON.stringify(store))
+}
+
+function demoActor(store, token) {
+  if (!token) return null
+  const [, userId] = String(token).split(':')
+  return store.users.find((user) => user.id === userId) || null
+}
+
+function demoToken(userId) {
+  return `demo:${userId}:${Date.now()}`
+}
+
+function addDemoAuditLog(store, actor, actionType, targetType, targetId, beforeValue, afterValue) {
+  store.auditLogs.unshift({
+    id: uid('log'),
+    actorId: actor?.id || 'system',
+    actorName: actor?.name || 'system',
+    actionType,
+    targetType,
+    targetId,
+    beforeValue: beforeValue ?? null,
+    afterValue: afterValue ?? null,
+    ipAddress: 'github-pages-demo',
+    createdAt: new Date().toISOString(),
+  })
+}
+
+function recalculateChallengeInStore(store, challengeId) {
+  const challenge = store.challenges.find((item) => item.id === challengeId)
+  if (!challenge) return
+  const baseSuccessStatus = ['draft', 'recruiting', 'active'].includes(challenge.status) ? 'in_progress' : 'failed'
+  store.participants = store.participants.map((participant) => {
+    if (participant.challengeId !== challengeId) return participant
+    return {
+      ...participant,
+      approvedRoundCount: 0,
+      finalRank: null,
+      successStatus: baseSuccessStatus,
+      payoutAmount: 0,
+      payoutStatus: 'not_eligible',
+      paidOutAt: null,
+      updatedAt: new Date().toISOString(),
+    }
+  })
+
+  const resultMap = calculateResults(store)
+  store.participants = store.participants.map((participant) => {
+    if (participant.challengeId !== challengeId) return participant
+    const result = resultMap[participant.id]
+    if (!result) return participant
+    const payoutAmount = result.successStatus === 'success' ? Number(challenge.entryFeeDisplay || 0) : 0
+    const payoutStatus = result.successStatus === 'success'
+      ? (['paid', 'hold'].includes(participant.payoutStatus) ? participant.payoutStatus : 'pending')
+      : 'not_eligible'
+    return {
+      ...participant,
+      approvedRoundCount: result.approvedRoundCount,
+      finalRank: result.finalRank,
+      successStatus: result.successStatus,
+      payoutAmount,
+      payoutStatus,
+      paidOutAt: payoutStatus === 'paid' ? (participant.paidOutAt || new Date().toISOString()) : null,
+      updatedAt: new Date().toISOString(),
+    }
+  })
+}
+
+function buildWinnersCsv(store, challengeId) {
+  const challenge = store.challenges.find((item) => item.id === challengeId)
+  const rows = store.participants
+    .filter((item) => item.challengeId === challengeId)
+    .map((participant) => {
+      const user = store.users.find((item) => item.id === participant.userId)
+      return {
+        challenge_id: challenge.id,
+        platform_type: challenge.platformType,
+        challenge_title: challenge.title,
+        user_id: user.id,
+        user_name: user.name,
+        user_email: user.email,
+        user_phone: user.phone,
+        approved_round_count: participant.approvedRoundCount || 0,
+        required_approval_count: challenge.requiredApprovalCount,
+        final_rank: participant.finalRank || '',
+        success_status: participant.successStatus,
+        payout_amount: participant.payoutAmount || 0,
+        payout_status: participant.payoutStatus,
+        paid_out_at: participant.paidOutAt || '',
+        payment_status: participant.paymentStatus,
+        participation_status: participant.participationStatus,
+      }
+    })
+  if (!rows.length) return ''
+  const headers = Object.keys(rows[0])
+  const escape = (value) => `"${String(value ?? '').replaceAll('"', '""')}"`
+  return [headers.join(','), ...rows.map((row) => headers.map((key) => escape(row[key])).join(','))].join('\n')
+}
+
+async function demoApiRequest(path, { method = 'GET', body, token } = {}) {
+  const store = readDemoStore()
+  const actor = demoActor(store, token)
+  const nowIso = new Date().toISOString()
+
+  if (path === '/api/bootstrap' && method === 'GET') {
+    return { store: sanitizeStore(store) }
+  }
+
+  if (path === '/api/auth/login' && method === 'POST') {
+    const user = store.users.find((item) => item.email === String(body.email || '').trim())
+    if (!user || user.password !== body.password) throw new Error('이메일 또는 비밀번호가 올바르지 않습니다.')
+    return { user: sanitizeStore({ ...store, users: [user] }).users[0], token: demoToken(user.id), store: sanitizeStore(store) }
+  }
+
+  if (path === '/api/auth/register' && method === 'POST') {
+    if (store.users.some((item) => item.email === String(body.email || '').trim())) throw new Error('이미 가입된 이메일입니다.')
+    store.users.push({
+      id: uid('u'),
+      name: String(body.name || '').trim(),
+      email: String(body.email || '').trim(),
+      password: String(body.password || ''),
+      phone: String(body.phone || '').trim(),
+      role: 'participant',
+      status: 'active',
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    })
+    writeDemoStore(store)
+    return { ok: true, store: sanitizeStore(store) }
+  }
+
+  if (path === '/api/auth/logout' && method === 'POST') return { ok: true }
+
+  if (!actor && path !== '/api/bootstrap') throw new Error('로그인이 필요합니다.')
+
+  if (path === '/api/admin/challenges' && method === 'POST') {
+    const challenge = {
+      id: uid('c'),
+      ...body,
+      createdBy: actor.id,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    }
+    store.challenges.unshift(challenge)
+    addDemoAuditLog(store, actor, 'challenge.create', 'challenge', challenge.id, null, challenge)
+    writeDemoStore(store)
+    return { store: sanitizeStore(store) }
+  }
+
+  const challengeUpdateMatch = path.match(/^\/api\/admin\/challenges\/([^/]+)$/)
+  if (challengeUpdateMatch && method === 'PATCH') {
+    const challengeId = challengeUpdateMatch[1]
+    const index = store.challenges.findIndex((item) => item.id === challengeId)
+    const before = clone(store.challenges[index])
+    store.challenges[index] = { ...store.challenges[index], ...body, updatedAt: nowIso }
+    addDemoAuditLog(store, actor, 'challenge.update', 'challenge', challengeId, before, store.challenges[index])
+    writeDemoStore(store)
+    return { store: sanitizeStore(store) }
+  }
+
+  const challengeStatusMatch = path.match(/^\/api\/admin\/challenges\/([^/]+)\/status$/)
+  if (challengeStatusMatch && method === 'PATCH') {
+    const challengeId = challengeStatusMatch[1]
+    const challenge = store.challenges.find((item) => item.id === challengeId)
+    const before = clone(challenge)
+    challenge.status = body.status
+    challenge.updatedAt = nowIso
+    recalculateChallengeInStore(store, challengeId)
+    addDemoAuditLog(store, actor, 'challenge.status', 'challenge', challengeId, before, challenge)
+    writeDemoStore(store)
+    return { store: sanitizeStore(store) }
+  }
+
+  const challengeBillingMatch = path.match(/^\/api\/admin\/challenges\/([^/]+)\/billing$/)
+  if (challengeBillingMatch && method === 'PATCH') {
+    const challengeId = challengeBillingMatch[1]
+    const challenge = store.challenges.find((item) => item.id === challengeId)
+    const before = clone(challenge)
+    Object.assign(challenge, body, { updatedAt: nowIso })
+    addDemoAuditLog(store, actor, 'challenge.billing', 'challenge', challengeId, before, challenge)
+    writeDemoStore(store)
+    return { store: sanitizeStore(store) }
+  }
+
+  const joinMatch = path.match(/^\/api\/challenges\/([^/]+)\/join$/)
+  if (joinMatch && method === 'POST') {
+    const challengeId = joinMatch[1]
+    const challenge = store.challenges.find((item) => item.id === challengeId)
+    if (challenge.status !== 'recruiting') throw new Error('모집 중인 챌린지만 신청할 수 있습니다.')
+    if (store.participants.some((item) => item.challengeId === challengeId && item.userId === actor.id)) throw new Error('이미 신청한 챌린지입니다.')
+    const currentCount = store.participants.filter((item) => item.challengeId === challengeId && item.participationStatus !== 'canceled').length
+    if (currentCount >= challenge.maxParticipants) throw new Error('최대 참가자 수에 도달했습니다.')
+    store.participants.push({
+      id: uid('p'),
+      challengeId,
+      userId: actor.id,
+      paymentStatus: 'pending',
+      participationStatus: 'applied',
+      joinedAt: nowIso,
+      confirmedAt: null,
+      approvedRoundCount: 0,
+      finalRank: null,
+      successStatus: 'in_progress',
+      payoutAmount: 0,
+      payoutStatus: 'not_eligible',
+      payoutMemo: '',
+      paidOutAt: null,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    })
+    writeDemoStore(store)
+    return { store: sanitizeStore(store) }
+  }
+
+  const participantMatch = path.match(/^\/api\/admin\/participants\/([^/]+)$/)
+  if (participantMatch && method === 'PATCH') {
+    const participant = store.participants.find((item) => item.id === participantMatch[1])
+    const before = clone(participant)
+    let participationStatus = body.participationStatus ?? participant.participationStatus
+    let confirmedAt = participant.confirmedAt
+    if (body.paymentStatus === 'paid') {
+      participationStatus = 'confirmed'
+      confirmedAt = nowIso
+    }
+    if (body.paymentStatus === 'refunded' || body.paymentStatus === 'canceled') {
+      participationStatus = 'canceled'
+      confirmedAt = null
+    }
+    Object.assign(participant, body, { participationStatus, confirmedAt, updatedAt: nowIso })
+    recalculateChallengeInStore(store, participant.challengeId)
+    addDemoAuditLog(store, actor, 'participant.update', 'participant', participant.id, before, participant)
+    writeDemoStore(store)
+    return { store: sanitizeStore(store) }
+  }
+
+  const payoutMatch = path.match(/^\/api\/admin\/participants\/([^/]+)\/payout$/)
+  if (payoutMatch && method === 'PATCH') {
+    const participant = store.participants.find((item) => item.id === payoutMatch[1])
+    const before = clone(participant)
+    Object.assign(participant, body, {
+      paidOutAt: body.payoutStatus === 'paid' ? (participant.paidOutAt || nowIso) : null,
+      updatedAt: nowIso,
+    })
+    addDemoAuditLog(store, actor, 'participant.payout', 'participant', participant.id, before, participant)
+    writeDemoStore(store)
+    return { store: sanitizeStore(store) }
+  }
+
+  const submissionMatch = path.match(/^\/api\/challenges\/([^/]+)\/submissions$/)
+  if (submissionMatch && method === 'POST') {
+    const challengeId = submissionMatch[1]
+    const challenge = store.challenges.find((item) => item.id === challengeId)
+    const participant = store.participants.find((item) => item.challengeId === challengeId && item.userId === actor.id)
+    if (!participant) throw new Error('참가 신청 내역이 없습니다.')
+    if (participant.paymentStatus !== 'paid' || participant.participationStatus !== 'confirmed') throw new Error('참가 확정 후 인증을 제출할 수 있습니다.')
+    if (challenge.status !== 'active') throw new Error('진행 중인 챌린지만 인증을 제출할 수 있습니다.')
+    const currentDate = new Date()
+    if (currentDate < new Date(challenge.challengeStartAt) || currentDate > new Date(`${challenge.challengeEndAt}T23:59:59`)) throw new Error('챌린지 진행 기간에만 제출할 수 있습니다.')
+    const missionRound = Number(body.missionRound)
+    if (!Number.isInteger(missionRound) || missionRound < 1 || missionRound > challenge.totalMissionCount) throw new Error('미션 회차를 확인해 주세요.')
+    const linkError = validateProofLink(challenge.platformType, body.linkUrl)
+    if (linkError) throw new Error(linkError)
+    const hasDuplicate = store.submissions.some((item) => item.participantId === participant.id && item.missionRound === missionRound && ['pending', 'approved'].includes(item.status))
+    if (hasDuplicate) {
+      const error = new Error('이미 제출했거나 승인된 회차입니다. 반려된 경우에만 다시 제출할 수 있습니다.')
+      error.status = 409
+      throw error
+    }
+    store.submissions.unshift({
+      id: uid('s'),
+      challengeId,
+      participantId: participant.id,
+      userId: actor.id,
+      missionRound,
+      linkUrl: String(body.linkUrl || '').trim(),
+      description: String(body.description || '').trim(),
+      status: 'pending',
+      submittedAt: nowIso,
+      reviewedBy: null,
+      reviewedAt: null,
+      rejectReason: '',
+      rejectDetail: '',
+      imageData: body.imageData || '',
+      imageName: body.imageName || '',
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    })
+    writeDemoStore(store)
+    return { store: sanitizeStore(store) }
+  }
+
+  const reviewMatch = path.match(/^\/api\/admin\/submissions\/([^/]+)\/review$/)
+  if (reviewMatch && method === 'PATCH') {
+    const submission = store.submissions.find((item) => item.id === reviewMatch[1])
+    const before = clone(submission)
+    Object.assign(submission, {
+      status: body.status,
+      reviewedBy: actor.id,
+      reviewedAt: nowIso,
+      rejectReason: body.status === 'rejected' ? body.rejectReason || '' : '',
+      rejectDetail: body.status === 'rejected' ? body.rejectDetail || '' : '',
+      updatedAt: nowIso,
+    })
+    recalculateChallengeInStore(store, submission.challengeId)
+    addDemoAuditLog(store, actor, body.status === 'approved' ? 'submission.approve' : 'submission.reject', 'submission', submission.id, before, submission)
+    writeDemoStore(store)
+    return { store: sanitizeStore(store) }
+  }
+
+  const recalcMatch = path.match(/^\/api\/admin\/challenges\/([^/]+)\/recalculate-results$/)
+  if (recalcMatch && method === 'POST') {
+    const challengeId = recalcMatch[1]
+    const before = clone(store.participants.filter((item) => item.challengeId === challengeId))
+    recalculateChallengeInStore(store, challengeId)
+    const after = clone(store.participants.filter((item) => item.challengeId === challengeId))
+    addDemoAuditLog(store, actor, 'challenge.recalculate', 'challenge', challengeId, before, after)
+    writeDemoStore(store)
+    return { store: sanitizeStore(store) }
+  }
+
+  throw new Error(`지원하지 않는 데모 요청입니다: ${method} ${path}`)
+}
+
 async function apiRequest(path, { method = 'GET', body, token } = {}) {
+  if (DEMO_MODE) return demoApiRequest(path, { method, body, token })
   const response = await fetch(path, {
     method,
     headers: {
@@ -439,19 +792,25 @@ function App() {
 
   const downloadCsv = (challengeId) => withRemote(async () => {
     const challenge = store.challenges.find((item) => item.id === challengeId)
-    const response = await fetch(`/api/admin/challenges/${challengeId}/winners.csv`, {
-      headers: { Authorization: `Bearer ${session.token}` },
-    })
-    if (!response.ok) throw new Error('CSV 다운로드에 실패했습니다.')
-    const blob = await response.blob()
+    const blob = DEMO_MODE
+      ? new Blob([`\ufeff${buildWinnersCsv(store, challengeId)}`], { type: 'text/csv;charset=utf-8' })
+      : await (async () => {
+          const response = await fetch(`/api/admin/challenges/${challengeId}/winners.csv`, {
+            headers: { Authorization: `Bearer ${session.token}` },
+          })
+          if (!response.ok) throw new Error('CSV 다운로드에 실패했습니다.')
+          return response.blob()
+        })()
     const url = URL.createObjectURL(blob)
     const link = document.createElement('a')
     link.href = url
     link.download = `challenge-${challenge.id}-winners-${new Date().toISOString().slice(0, 10).replaceAll('-', '')}.csv`
     link.click()
     URL.revokeObjectURL(url)
-    const payload = await apiRequest('/api/bootstrap')
-    applyRemoteStore(payload)
+    if (!DEMO_MODE) {
+      const payload = await apiRequest('/api/bootstrap')
+      applyRemoteStore(payload)
+    }
     showToast('CSV를 다운로드했습니다.')
   })
 
