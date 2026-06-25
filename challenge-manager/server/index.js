@@ -1,7 +1,7 @@
 import cors from 'cors'
 import express from 'express'
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
@@ -9,6 +9,7 @@ import { DatabaseSync } from 'node:sqlite'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const dataDir = join(__dirname, '..', 'data')
 mkdirSync(dataDir, { recursive: true })
+const localConfigPath = join(__dirname, 'local.config.json')
 
 const db = new DatabaseSync(join(dataDir, 'challenge-manager.sqlite'))
 const app = express()
@@ -20,6 +21,28 @@ app.use(express.json({ limit: '2mb' }))
 const now = () => new Date().toISOString()
 const uid = (prefix) => `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`
 const token = () => randomBytes(32).toString('hex')
+const currencyAmount = (value) => `${Number(value || 0).toLocaleString('ko-KR')}원`
+
+function readLocalConfig() {
+  if (!existsSync(localConfigPath)) return {}
+  try {
+    return JSON.parse(readFileSync(localConfigPath, 'utf8'))
+  } catch {
+    return {}
+  }
+}
+
+const localConfig = readLocalConfig()
+const notificationConfig = {
+  baseUrl: String(localConfig.notifications?.baseUrl || process.env.NOTIFICATION_API_BASE_URL || '').trim(),
+  serviceCode: String(localConfig.notifications?.serviceCode || process.env.NOTIFICATION_SERVICE_CODE || '').trim(),
+  serviceKey: String(localConfig.notifications?.serviceKey || process.env.NOTIFICATION_SERVICE_KEY || '').trim(),
+  defaultFromEmail: String(localConfig.notifications?.defaultFromEmail || process.env.NOTIFICATION_FROM_EMAIL || '').trim(),
+  enabledChannels: {
+    sms: Boolean(localConfig.notifications?.enabledChannels?.sms ?? true),
+    email: Boolean(localConfig.notifications?.enabledChannels?.email ?? true),
+  },
+}
 
 const platformHosts = {
   blog: ['blog.naver.com', 'm.blog.naver.com', 'tistory.com', 'brunch.co.kr', 'medium.com', 'velog.io', 'wordpress.com', 'blogspot.com'],
@@ -162,6 +185,22 @@ function initSchema() {
       before_value TEXT,
       after_value TEXT,
       ip_address TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS notification_logs (
+      id TEXT PRIMARY KEY,
+      challenge_id TEXT,
+      participant_id TEXT,
+      user_id TEXT,
+      channel TEXT NOT NULL,
+      template_code TEXT NOT NULL,
+      recipient TEXT NOT NULL,
+      subject TEXT,
+      message_text TEXT,
+      status TEXT NOT NULL,
+      response_payload TEXT,
+      error_message TEXT,
       created_at TEXT NOT NULL
     );
 
@@ -353,6 +392,22 @@ const auditFrom = (row) => ({
   createdAt: row.created_at,
 })
 
+const notificationLogFrom = (row) => ({
+  id: row.id,
+  challengeId: row.challenge_id,
+  participantId: row.participant_id,
+  userId: row.user_id,
+  channel: row.channel,
+  templateCode: row.template_code,
+  recipient: row.recipient,
+  subject: row.subject || '',
+  messageText: row.message_text || '',
+  status: row.status,
+  responsePayload: parseJson(row.response_payload),
+  errorMessage: row.error_message || '',
+  createdAt: row.created_at,
+})
+
 function getStore() {
   return {
     users: db.prepare('SELECT * FROM users ORDER BY created_at ASC').all().map(userFrom),
@@ -360,6 +415,14 @@ function getStore() {
     participants: db.prepare('SELECT * FROM participants ORDER BY joined_at DESC').all().map(participantFrom),
     submissions: db.prepare('SELECT * FROM submissions ORDER BY submitted_at DESC').all().map(submissionFrom),
     auditLogs: db.prepare('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 500').all().map(auditFrom),
+    notificationLogs: db.prepare('SELECT * FROM notification_logs ORDER BY created_at DESC LIMIT 200').all().map(notificationLogFrom),
+    notificationConfig: {
+      enabled: Boolean(notificationConfig.baseUrl && notificationConfig.serviceKey),
+      serviceCode: notificationConfig.serviceCode,
+      baseUrl: notificationConfig.baseUrl,
+      channels: notificationConfig.enabledChannels,
+      defaultFromEmail: notificationConfig.defaultFromEmail,
+    },
   }
 }
 
@@ -409,6 +472,70 @@ function requireAdmin(req, res, next) {
   const user = actor(req)
   if (user.role !== 'admin') return res.status(403).json({ error: '관리자 권한이 필요합니다.' })
   next()
+}
+
+function logNotification({ challengeId = null, participantId = null, userId = null, channel, templateCode, recipient, subject = '', messageText = '', status, responsePayload = null, errorMessage = '' }) {
+  db.prepare(`
+    INSERT INTO notification_logs (
+      id, challenge_id, participant_id, user_id, channel, template_code, recipient, subject, message_text,
+      status, response_payload, error_message, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(uid('ntf'), challengeId, participantId, userId, channel, templateCode, recipient, subject, messageText, status, asJson(responsePayload), errorMessage, now())
+}
+
+async function postNotification(path, body) {
+  const response = await fetch(`${notificationConfig.baseUrl}${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-service-key': notificationConfig.serviceKey,
+    },
+    body: JSON.stringify(body),
+  })
+  const payload = await response.json().catch(() => ({}))
+  if (!response.ok || payload.success === false) {
+    throw new Error(payload.errorMessage || payload.message || `알림 발송 실패 (${response.status})`)
+  }
+  return payload
+}
+
+async function sendSmsNotification({ challengeId = null, participantId = null, userId = null, templateCode, to, text }) {
+  if (!notificationConfig.enabledChannels.sms || !notificationConfig.baseUrl || !notificationConfig.serviceKey || !to || !text) return
+  try {
+    const payload = await postNotification('/api/v1/messages/sms/send', {
+      requestId: uid('sms'),
+      to,
+      text,
+    })
+    logNotification({ challengeId, participantId, userId, channel: 'sms', templateCode, recipient: to, messageText: text, status: 'sent', responsePayload: payload })
+  } catch (error) {
+    logNotification({ challengeId, participantId, userId, channel: 'sms', templateCode, recipient: to, messageText: text, status: 'failed', errorMessage: error.message })
+  }
+}
+
+async function sendEmailNotification({ challengeId = null, participantId = null, userId = null, templateCode, to, subject, text, html = '' }) {
+  if (!notificationConfig.enabledChannels.email || !notificationConfig.baseUrl || !notificationConfig.serviceKey || !to || !subject || !(text || html)) return
+  try {
+    const payload = await postNotification('/api/v1/messages/email/send', {
+      requestId: uid('email'),
+      to,
+      subject,
+      text,
+      ...(html ? { html } : {}),
+      ...(notificationConfig.defaultFromEmail ? { from: notificationConfig.defaultFromEmail } : {}),
+    })
+    logNotification({ challengeId, participantId, userId, channel: 'email', templateCode, recipient: to, subject, messageText: text, status: 'sent', responsePayload: payload })
+  } catch (error) {
+    logNotification({ challengeId, participantId, userId, channel: 'email', templateCode, recipient: to, subject, messageText: text, status: 'failed', errorMessage: error.message })
+  }
+}
+
+async function notifyParticipant(user, participant, challenge, templateCode, smsText, emailSubject, emailText) {
+  if (!user) return
+  await Promise.all([
+    sendSmsNotification({ challengeId: challenge?.id || null, participantId: participant?.id || null, userId: user.id, templateCode, to: user.phone, text: smsText }),
+    sendEmailNotification({ challengeId: challenge?.id || null, participantId: participant?.id || null, userId: user.id, templateCode, to: user.email, subject: emailSubject, text: emailText }),
+  ])
 }
 
 function calculateResults(challengeId) {
@@ -629,6 +756,8 @@ app.post('/api/challenges/:id/join', (req, res) => {
 
 app.patch('/api/admin/participants/:id', requireAdmin, (req, res) => {
   const before = participantFrom(db.prepare('SELECT * FROM participants WHERE id = ?').get(req.params.id))
+  const challenge = challengeFrom(db.prepare('SELECT * FROM challenges WHERE id = ?').get(before.challengeId))
+  const user = userFrom(db.prepare('SELECT * FROM users WHERE id = ?').get(before.userId))
   let participationStatus = req.body.participationStatus ?? before.participationStatus
   let confirmedAt = before.confirmedAt
   if (req.body.paymentStatus === 'paid') {
@@ -644,6 +773,17 @@ app.patch('/api/admin/participants/:id', requireAdmin, (req, res) => {
   `).run(req.body.paymentStatus ?? before.paymentStatus, participationStatus, confirmedAt, now(), req.params.id)
   calculateResults(before.challengeId)
   audit(req, 'participant.update', 'participant', req.params.id, before, req.body)
+  if (before.paymentStatus !== 'paid' && req.body.paymentStatus === 'paid') {
+    notifyParticipant(
+      user,
+      before,
+      challenge,
+      'payment_confirmed',
+      `[${challenge.title}] 참가 확정 및 결제 완료 처리되었습니다.`,
+      `[챌린지 매니저] ${challenge.title} 참가 확정`,
+      `${user.name}님, ${challenge.title} 챌린지의 결제가 확인되어 참가가 확정되었습니다.`,
+    ).catch(() => {})
+  }
   sendStore(res)
 })
 
@@ -651,6 +791,8 @@ app.patch('/api/admin/participants/:id/payout', requireAdmin, (req, res) => {
   const beforeRow = db.prepare('SELECT * FROM participants WHERE id = ?').get(req.params.id)
   if (!beforeRow) return res.status(404).json({ error: '참가자를 찾을 수 없습니다.' })
   const before = participantFrom(beforeRow)
+  const challenge = challengeFrom(db.prepare('SELECT * FROM challenges WHERE id = ?').get(before.challengeId))
+  const user = userFrom(db.prepare('SELECT * FROM users WHERE id = ?').get(before.userId))
   const nextStatus = req.body.payoutStatus ?? before.payoutStatus
   const nextPaidOutAt = nextStatus === 'paid' ? (before.paidOutAt || now()) : null
   db.prepare(`
@@ -666,6 +808,18 @@ app.patch('/api/admin/participants/:id/payout', requireAdmin, (req, res) => {
     req.params.id,
   )
   audit(req, 'participant.payout', 'participant', req.params.id, before, req.body)
+  if (before.payoutStatus !== 'paid' && nextStatus === 'paid') {
+    const payoutAmount = Number(req.body.payoutAmount ?? before.payoutAmount ?? 0)
+    notifyParticipant(
+      user,
+      before,
+      challenge,
+      'payout_paid',
+      `[${challenge.title}] 상금 ${currencyAmount(payoutAmount)} 지급 완료`,
+      `[챌린지 매니저] ${challenge.title} 상금 지급 완료`,
+      `${user.name}님, ${challenge.title} 챌린지 상금 ${currencyAmount(payoutAmount)} 지급이 완료되었습니다.`,
+    ).catch(() => {})
+  }
   sendStore(res)
 })
 
@@ -706,6 +860,9 @@ app.post('/api/challenges/:id/submissions', (req, res) => {
 
 app.patch('/api/admin/submissions/:id/review', requireAdmin, (req, res) => {
   const before = submissionFrom(db.prepare('SELECT * FROM submissions WHERE id = ?').get(req.params.id))
+  const challenge = challengeFrom(db.prepare('SELECT * FROM challenges WHERE id = ?').get(before.challengeId))
+  const participant = participantFrom(db.prepare('SELECT * FROM participants WHERE id = ?').get(before.participantId))
+  const user = userFrom(db.prepare('SELECT * FROM users WHERE id = ?').get(before.userId))
   const status = req.body.status
   db.prepare(`
     UPDATE submissions SET status = ?, reviewed_by = ?, reviewed_at = ?, reject_reason = ?, reject_detail = ?, updated_at = ?
@@ -713,6 +870,28 @@ app.patch('/api/admin/submissions/:id/review', requireAdmin, (req, res) => {
   `).run(status, actor(req).id, now(), status === 'rejected' ? req.body.rejectReason || '' : '', status === 'rejected' ? req.body.rejectDetail || '' : '', now(), req.params.id)
   audit(req, status === 'approved' ? 'submission.approve' : 'submission.reject', 'submission', req.params.id, before, req.body)
   calculateResults(before.challengeId)
+  if (status === 'approved') {
+    notifyParticipant(
+      user,
+      participant,
+      challenge,
+      'submission_approved',
+      `[${challenge.title}] ${before.missionRound}회차 인증이 승인되었습니다.`,
+      `[챌린지 매니저] ${challenge.title} 인증 승인`,
+      `${user.name}님, ${challenge.title} 챌린지 ${before.missionRound}회차 인증이 승인되었습니다.`,
+    ).catch(() => {})
+  } else if (status === 'rejected') {
+    const rejectMessage = [req.body.rejectReason, req.body.rejectDetail].filter(Boolean).join(' / ')
+    notifyParticipant(
+      user,
+      participant,
+      challenge,
+      'submission_rejected',
+      `[${challenge.title}] ${before.missionRound}회차 인증이 반려되었습니다. ${rejectMessage}`.trim(),
+      `[챌린지 매니저] ${challenge.title} 인증 반려`,
+      `${user.name}님, ${challenge.title} 챌린지 ${before.missionRound}회차 인증이 반려되었습니다. ${rejectMessage}`.trim(),
+    ).catch(() => {})
+  }
   sendStore(res)
 })
 
@@ -722,6 +901,24 @@ app.post('/api/admin/challenges/:id/recalculate-results', requireAdmin, (req, re
   const after = db.prepare('SELECT * FROM participants WHERE challenge_id = ?').all(req.params.id).map(participantFrom)
   audit(req, 'challenge.recalculate', 'challenge', req.params.id, before, after)
   sendStore(res)
+})
+
+app.post('/api/admin/notifications/test', requireAdmin, async (req, res) => {
+  const { channel, to, subject, text } = req.body
+  if (!['sms', 'email'].includes(channel)) return res.status(400).json({ error: '지원하지 않는 발송 채널입니다.' })
+  if (!to || !text) return res.status(400).json({ error: '수신자와 내용은 필수입니다.' })
+  if (channel === 'email' && !subject) return res.status(400).json({ error: '이메일 제목은 필수입니다.' })
+  try {
+    if (channel === 'sms') {
+      await sendSmsNotification({ templateCode: 'manual_test_sms', to, text })
+    } else {
+      await sendEmailNotification({ templateCode: 'manual_test_email', to, subject, text })
+    }
+    audit(req, 'notification.test_send', 'notification', to, null, { channel, to, subject: subject || '', text })
+    sendStore(res)
+  } catch (error) {
+    res.status(500).json({ error: error.message || '테스트 발송에 실패했습니다.' })
+  }
 })
 
 app.get('/api/admin/challenges/:id/winners.csv', requireAdmin, (req, res) => {

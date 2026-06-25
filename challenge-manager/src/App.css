@@ -568,6 +568,10 @@ td pre {
   max-width: 980px;
 }
 
+.compact-form {
+  max-width: none;
+}
+
 .form-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

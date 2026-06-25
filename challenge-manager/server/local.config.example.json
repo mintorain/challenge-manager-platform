@@ -1,0 +1,12 @@
+{
+  "notifications": {
+    "baseUrl": "http://127.0.0.1:4174",
+    "serviceCode": "your-service-code",
+    "serviceKey": "your-service-api-key",
+    "defaultFromEmail": "no-reply@example.com",
+    "enabledChannels": {
+      "sms": true,
+      "email": true
+    }
+  }
+}

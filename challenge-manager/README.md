@@ -71,6 +71,8 @@ user@challenge.local / user1234
 - 관리자 참가자 검색/필터
 - 관리자 인증 심사 검색/필터
 - 관리자 인증 선택 일괄 승인
+- 문자/이메일 발송 API 연동
+- 관리자 테스트 발송 및 알림 로그
 - 성공자 CSV 다운로드
 - 감사 로그
 - 고객명, 예상 청구 금액, 청구 상태 관리
@@ -93,6 +95,26 @@ user@challenge.local / user1234
 사진 인증은 현재 SQLite에 base64 데이터로 저장되므로 700KB 이하 이미지로 제한됩니다. 실제 서비스에서는 S3, Supabase Storage 같은 별도 파일 저장소로 분리하는 것이 좋습니다.
 
 GitHub Pages 배포본은 Express API 없이 동작하는 브라우저 demo 모드입니다. 이 경우 데이터는 브라우저 `localStorage`에 저장되며, 관리자/참가자 흐름을 체험할 수 있습니다.
+
+## 알림 연동 설정
+
+문자/이메일 발송은 `server/local.config.json`에 로컬 전용 설정으로 연결합니다. 공개 저장소에는 포함되지 않으며, 예시는 `server/local.config.example.json`에 있습니다.
+
+설정 항목:
+
+- `baseUrl`: smsAPI 서버 주소
+- `serviceCode`: 관리자에서 발급한 서비스 코드
+- `serviceKey`: 발급한 서비스 API 키
+- `defaultFromEmail`: 이메일 발신 주소
+
+현재 서버는 아래 이벤트에서 자동 발송을 시도합니다.
+
+- 참가 결제 완료 및 참가 확정
+- 인증 승인
+- 인증 반려
+- 상금 지급 완료
+
+관리자 화면의 `알림 발송` 메뉴에서 SMS/EMAIL 테스트 발송과 최근 발송 로그를 확인할 수 있습니다.
 
 ## 인증 제출 정책
 

@@ -13,6 +13,7 @@ dist-ssr
 *.local
 data/*.sqlite
 data/*.sqlite-*
+server/local.config.json
 
 # Editor directories and files
 .vscode/*

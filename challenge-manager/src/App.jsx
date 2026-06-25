@@ -15,9 +15,12 @@ import {
   Link as LinkIcon,
   ListChecks,
   LogOut,
+  Mail,
+  MessageSquare,
   Plus,
   RefreshCw,
   Search,
+  Send,
   ShieldCheck,
   UserRound,
   Users,
@@ -249,6 +252,14 @@ const seedData = () => ({
     },
   ],
   auditLogs: [],
+  notificationLogs: [],
+  notificationConfig: {
+    enabled: DEMO_MODE,
+    serviceCode: 'mintorain',
+    baseUrl: DEMO_MODE ? 'github-pages-demo' : 'http://127.0.0.1:4174',
+    channels: { sms: true, email: true },
+    defaultFromEmail: 'no-reply@mintorain.local',
+  },
 })
 
 function sanitizeStore(store) {
@@ -595,6 +606,26 @@ async function demoApiRequest(path, { method = 'GET', body, token } = {}) {
     return { store: sanitizeStore(store) }
   }
 
+  if (path === '/api/admin/notifications/test' && method === 'POST') {
+    store.notificationLogs.unshift({
+      id: uid('ntf'),
+      challengeId: null,
+      participantId: null,
+      userId: actor.id,
+      channel: body.channel,
+      templateCode: body.channel === 'sms' ? 'manual_test_sms' : 'manual_test_email',
+      recipient: body.to,
+      subject: body.subject || '',
+      messageText: body.text || '',
+      status: 'sent',
+      responsePayload: { demo: true },
+      errorMessage: '',
+      createdAt: nowIso,
+    })
+    writeDemoStore(store)
+    return { store: sanitizeStore(store) }
+  }
+
   throw new Error(`지원하지 않는 데모 요청입니다: ${method} ${path}`)
 }
 
@@ -793,6 +824,16 @@ function App() {
     showToast(`${submissionIds.length}건 인증을 일괄 승인했습니다.`)
   })
 
+  const sendTestNotification = (form) => withRemote(async () => {
+    const payload = await apiRequest('/api/admin/notifications/test', {
+      method: 'POST',
+      body: form,
+      token: session.token,
+    })
+    applyRemoteStore(payload)
+    showToast(`${form.channel === 'sms' ? '문자' : '이메일'} 테스트 발송을 요청했습니다.`)
+  })
+
   const recalculate = (challengeId) => withRemote(async () => {
     const payload = await apiRequest(`/api/admin/challenges/${challengeId}/recalculate-results`, {
       method: 'POST',
@@ -864,6 +905,7 @@ function App() {
           updatePayout={updatePayout}
           reviewSubmission={reviewSubmission}
           bulkApproveSubmissions={bulkApproveSubmissions}
+          sendTestNotification={sendTestNotification}
           recalculate={recalculate}
           downloadCsv={downloadCsv}
         />
@@ -971,6 +1013,7 @@ function AdminShell(props) {
     'admin-submissions': '인증 심사',
     'admin-ranking': '랭킹/성공자',
     'admin-settlement': '상금 정산',
+    'admin-notifications': '알림 발송',
     'admin-audit': '감사 로그',
   }
   return (
@@ -982,6 +1025,7 @@ function AdminShell(props) {
           <NavButton icon={<ListChecks />} label="챌린지" active={['admin-challenges', 'admin-challenge-form', 'admin-participants', 'admin-ranking'].includes(page)} onClick={() => setPage('admin-challenges')} />
           <NavButton icon={<ClipboardCheck />} label="인증 심사" active={page === 'admin-submissions'} onClick={() => setPage('admin-submissions')} />
           <NavButton icon={<BadgeCheck />} label="상금 정산" active={page === 'admin-settlement'} onClick={() => setPage('admin-settlement')} />
+          <NavButton icon={<Send />} label="알림 발송" active={page === 'admin-notifications'} onClick={() => setPage('admin-notifications')} />
           <NavButton icon={<ShieldCheck />} label="감사 로그" active={page === 'admin-audit'} onClick={() => setPage('admin-audit')} />
         </nav>
       </aside>
@@ -1000,6 +1044,7 @@ function AdminShell(props) {
         {page === 'admin-submissions' && <AdminSubmissions {...props} />}
         {page === 'admin-ranking' && <AdminRanking {...props} />}
         {page === 'admin-settlement' && <AdminSettlement {...props} />}
+        {page === 'admin-notifications' && <AdminNotifications {...props} />}
         {page === 'admin-audit' && <AuditLogs {...props} />}
       </main>
     </div>
@@ -1469,6 +1514,70 @@ function AdminSettlement({ store, selectedChallengeId, resultMap, recalculate, u
         </table>
       </div>
       {!rows.length && <Empty text="성공자로 확정된 참가자가 없습니다. 챌린지 종료 후 랭킹을 재계산해 주세요." />}
+    </section>
+  )
+}
+
+function AdminNotifications({ store, sendTestNotification }) {
+  const [form, setForm] = useState({ channel: 'sms', to: '', subject: '', text: '' })
+  const config = store.notificationConfig || { enabled: false, serviceCode: '', baseUrl: '', channels: { sms: false, email: false }, defaultFromEmail: '' }
+  const submit = (event) => {
+    event.preventDefault()
+    if (!form.to.trim() || !form.text.trim()) return
+    if (form.channel === 'email' && !form.subject.trim()) return
+    sendTestNotification({
+      channel: form.channel,
+      to: form.to.trim(),
+      subject: form.subject.trim(),
+      text: form.text.trim(),
+    })
+  }
+  return (
+    <section className="stack">
+      <div className="metric-grid notification-metrics">
+        <Metric icon={<Send />} label="알림 연동" value={config.enabled ? '활성' : '비활성'} tone={config.enabled ? 'success' : undefined} />
+        <Metric icon={<MessageSquare />} label="SMS 채널" value={config.channels?.sms ? '사용 가능' : '비활성'} />
+        <Metric icon={<Mail />} label="EMAIL 채널" value={config.channels?.email ? '사용 가능' : '비활성'} />
+      </div>
+      <Panel title="연동 정보">
+        <div className="mini-grid">
+          <span>서비스 코드: {config.serviceCode || '-'}</span>
+          <span>API 주소: {config.baseUrl || '-'}</span>
+          <span>기본 발신 이메일: {config.defaultFromEmail || '-'}</span>
+        </div>
+      </Panel>
+      <form className="form-page compact-form" onSubmit={submit}>
+        <FormSection title="테스트 발송">
+          <div className="form-grid">
+            <label>채널<select value={form.channel} onChange={(event) => setForm({ ...form, channel: event.target.value })}><option value="sms">SMS</option><option value="email">EMAIL</option></select></label>
+            <label>수신자<input value={form.to} onChange={(event) => setForm({ ...form, to: event.target.value })} placeholder={form.channel === 'sms' ? '01012345678' : 'user@example.com'} /></label>
+            {form.channel === 'email' && <label>제목<input value={form.subject} onChange={(event) => setForm({ ...form, subject: event.target.value })} placeholder="테스트 메일 제목" /></label>}
+          </div>
+          <label>내용<textarea value={form.text} onChange={(event) => setForm({ ...form, text: event.target.value })} placeholder={form.channel === 'sms' ? '테스트 문자 내용' : '테스트 이메일 내용'} /></label>
+          <div className="row-actions"><button className="primary-button" type="submit">테스트 발송</button></div>
+        </FormSection>
+      </form>
+      <Panel title="최근 발송 로그">
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>시각</th><th>채널</th><th>수신자</th><th>템플릿</th><th>상태</th><th>메시지</th><th>오류</th></tr></thead>
+            <tbody>
+              {(store.notificationLogs || []).map((log) => (
+                <tr key={log.id}>
+                  <td>{formatDateTime(log.createdAt)}</td>
+                  <td><StatusBadge status={log.channel === 'sms' ? 'planned' : 'invoiced'} /><span className="subtext">{log.channel.toUpperCase()}</span></td>
+                  <td>{log.recipient}</td>
+                  <td>{log.templateCode}</td>
+                  <td><StatusBadge status={log.status === 'sent' ? 'approved' : 'rejected'} /></td>
+                  <td><span className="subtext">{log.subject}</span>{log.messageText}</td>
+                  <td>{log.errorMessage || '-'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {!(store.notificationLogs || []).length && <Empty text="아직 발송 로그가 없습니다." />}
+      </Panel>
     </section>
   )
 }
